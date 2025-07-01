@@ -1,0 +1,632 @@
+import dataclasses
+import os
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
+
+import torch
+
+from vllm.config import ObservabilityConfig, VllmConfig
+from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
+from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.sequence import ExecuteModelRequest, IntermediateTensors
+from vllm.utils import (enable_trace_function_call_for_thread,
+                        resolve_obj_by_qualname, update_environment_variables)
+from vllm.worker.model_runner_base import (BroadcastableModelInput,
+                                           ModelRunnerBase,
+                                           ModelRunnerInputBase)
+
+logger = init_logger(__name__)
+
+
+class WorkerBase(ABC):
+    """Worker interface that allows vLLM to cleanly separate implementations for
+    different hardware. Also abstracts control plane communication, e.g., to
+    communicate request metadata to other workers.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+    ) -> None:
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = vllm_config.speculative_config
+        self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        self.observability_config = vllm_config.observability_config
+        self.kv_transfer_config = vllm_config.kv_transfer_config
+        from vllm.platforms import current_platform
+        self.current_platform = current_platform
+
+    @abstractmethod
+    def init_device(self) -> None:
+        """Initialize device state, such as loading the model or other on-device
+        memory allocations.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
+        """Determine the number of available blocks for the GPU KV cache and
+        swappable CPU KV cache.
+
+        The implementation may run profiling or other heuristics to determine
+        the size of caches.
+
+        Returns a Tuple[num_gpu_blocks, num_cpu_blocks], where num_gpu_blocks
+        are blocks that are "active" on the device and can be appended to.
+        num_cpu_blocks refers to "swapped" blocks in CPU memory and cannot be
+        appended to.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
+        """Initialize the KV cache with the given size in blocks.
+        """
+        raise NotImplementedError
+
+    def start_worker_execution_loop(self) -> None:
+        """Execute model loop in parallel worker.
+
+        You can stop the loop by executing a driver worker with an empty output.
+        See `stop_remote_worker_execution_loop` for more details.
+        """
+        with self.current_platform.inference_mode():
+            while True:
+                output = self.execute_model(execute_model_req=None)
+                if output is None:
+                    return None
+
+    @abstractmethod
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> Optional[List[SamplerOutput]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_cache_block_size_bytes(self) -> int:
+        """Return the size of a single cache block, in bytes. Used in
+        speculative decoding.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def remove_lora(self, lora_id: int) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def pin_lora(self, lora_id: int) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_loras(self) -> Set[int]:
+        raise NotImplementedError
+
+
+class LoraNotSupportedWorkerBase(WorkerBase):
+    """Partial implementation of WorkerBase that raises exceptions when LoRA
+    methods are invoked.
+    """
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        raise ValueError(f"{type(self)} does not support LoRA")
+
+    def remove_lora(self, lora_id: int) -> bool:
+        raise ValueError(f"{type(self)} does not support LoRA")
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return ValueError(
+            f"{type(self)} does not support LoRA")  # type: ignore
+
+    def list_loras(self) -> Set[int]:
+        raise ValueError(f"{type(self)} does not support LoRA")
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkerInput:
+    """Local inputs to each worker. May contain device-specific data. These
+    fields should be broadcastable to other workers.
+    """
+
+    num_seq_groups: Optional[int] = None
+    blocks_to_swap_in: Optional[torch.Tensor] = None
+    blocks_to_swap_out: Optional[torch.Tensor] = None
+    blocks_to_copy: Optional[torch.Tensor] = None
+    virtual_engine: int = 0
+    num_steps: int = 1
+
+    @classmethod
+    def from_broadcasted_tensor_dict(
+        cls: Type["WorkerInput"],
+        tensor_dict: Dict[str, Any],
+    ) -> "WorkerInput":
+        """
+        Pop fields from the given tensor_dict and populate a new instance of
+        WorkerInput.
+        """
+        return cls(
+            num_seq_groups=tensor_dict.pop("num_seq_groups"),
+            blocks_to_swap_in=tensor_dict.pop("blocks_to_swap_in"),
+            blocks_to_swap_out=tensor_dict.pop("blocks_to_swap_out"),
+            blocks_to_copy=tensor_dict.pop("blocks_to_copy"),
+            virtual_engine=tensor_dict["virtual_engine"],
+            num_steps=tensor_dict.pop("num_steps"),
+        )
+
+    def as_broadcastable_tensor_dict(
+            self) -> Dict[str, Union[int, torch.Tensor]]:
+        """
+        Extract broadcastable fields.
+        """
+        tensor_dict = {
+            "num_seq_groups": self.num_seq_groups,
+            "blocks_to_swap_in": self.blocks_to_swap_in,
+            "blocks_to_swap_out": self.blocks_to_swap_out,
+            "blocks_to_copy": self.blocks_to_copy,
+            "virtual_engine": self.virtual_engine,
+            "num_steps": self.num_steps,
+        }
+
+        return tensor_dict
+
+
+class LocalOrDistributedWorkerBase(WorkerBase):
+    """
+    Partial implementation of WorkerBase that has a default `execute_model`
+    definition to perform metadata transfer between workers when in distributed
+    mode. Subclasses of this interface should use model runners that inherit
+    from ModelRunnerBase, and should only need to implement worker-local logic.
+    If custom control plane logic is needed to transfer metadata, or if the
+    model runner cannot inherit from ModelRunnerBase, use WorkerBase instead.
+    """
+    is_driver_worker: bool
+    model_runner: ModelRunnerBase
+    observability_config: Optional[ObservabilityConfig] = None
+
+    @property
+    @abstractmethod
+    def do_metadata_broadcast(self) -> bool:
+        """
+        Used by the default `execute_model` to check whether broadcast is
+        needed to transfer request inputs from the driver worker to other
+        workers in the TP group. If WorkerBase subclass only supports
+        single-worker execution, then this method should return False.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def kv_cache(self) -> Optional[List[List[torch.Tensor]]]:
+        """
+        Gets the list of kv caches to pass to the worker's model runner. Each
+        element in the list is a kv cache corresponding to a particular virtual
+        engine (PP stream). Used by the default `execute_model`. If the worker's
+        model runner does not follow the ModelRunnerBase interface, then inherit
+        from WorkerBase instead.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_worker_input(
+            self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+        """
+        Prepare the inputs to WorkerBase.execute_worker from an execution
+        request. This method may move data to the worker's local device. It is
+        not allowed to communicate with other workers or devices.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def execute_worker(self, worker_input: WorkerInput) -> None:
+        """
+        Process an execution request.
+        """
+        raise NotImplementedError
+
+    def _get_worker_input_from_broadcast(
+        self
+    ) -> Optional[Tuple[BroadcastableModelInput, WorkerInput, Dict[
+            str, torch.Tensor]]]:
+        """ Get the worker input from the broadcasted tensor dict. """
+        assert self.do_metadata_broadcast
+        assert not self.is_driver_worker
+        broadcast_data = broadcast_tensor_dict(src=0)
+        if not broadcast_data:
+            logger.debug("[worker] received empty broadcast data")
+            return None
+        
+        logger.debug(f"[worker][broadcast_data keys] {list(broadcast_data.keys())}")
+        worker_input = WorkerInput.from_broadcasted_tensor_dict(broadcast_data)
+    
+        # pause_layers = broadcast_data.pop('pause_layers')
+        # resume_layers = broadcast_data.pop('resume_layers')
+        cache_plan = broadcast_data.pop('cache_plan')
+        dist_dict = broadcast_data.pop('dist_dict')
+        sid2row = broadcast_data.pop('sid2row')
+        # bm = broadcast_data.pop('bm')
+        new_gpu_blocks = broadcast_data.pop('new_gpu_blocks')
+        cached_all_token_ids  = broadcast_data.pop('cached_all_token_ids')
+
+        # logger.debug(f"[worker][pause_layers ] {pause_layers}")
+        # logger.debug(f"[worker][resume_layers] {resume_layers}")
+        logger.debug(f"[worker][cache_plan   ] dealloc={cache_plan.dealloc_layers}, alloc={cache_plan.alloc_layers}, resize={cache_plan.prefetch_resize}, pause={cache_plan.pause_layers}")
+        logger.debug(f"[worker][dist_dict    ] {dist_dict}")
+        logger.debug(f"[worker][sid2row      ] {sid2row}")
+        # logger.debug(f"[worker][bm           ] {bm}")
+        logger.debug(f"[worker][new_gpu_blocks] {new_gpu_blocks}")
+        logger.debug(f"[worker][cached_ids   ] {cached_all_token_ids['mappings'].keys()} -> token count {len(cached_all_token_ids['token_ids'])}")
+
+        model_input = (
+            self.model_runner.make_model_input_from_broadcasted_tensor_dict(
+                broadcast_data))
+
+        kwargs = extract_previous_hidden_states(broadcast_data)
+
+        cache_engine = self.cache_engine[worker_input.virtual_engine]
+
+        # logger.debug(f"[worker] registering block_manager to cache_engine#{worker_input.virtual_engine}")
+        # cache_engine.register_bm(bm)
+
+        # if cache_engine.pause_and_resume:
+        #     if pause_layers or resume_layers:
+        #         logger.debug(f"[worker] executing pause/resume on engine")
+        #         cache_engine.execute_pause_resume(
+        #             pause_layers, resume_layers
+        #         )
+
+        if cache_plan.dealloc_layers or cache_plan.alloc_layers or cache_plan.prefetch_resize or cache_plan.pause_layers:
+            logger.debug(f"[worker] executing cache_plan on engine#{worker_input.virtual_engine}")
+            cache_engine.execute_cache_plan(cache_plan, model_input.attn_metadata, sid2row, new_gpu_blocks)
+        
+        return model_input, worker_input, kwargs, cached_all_token_ids
+
+    def prepare_cache_plan(
+        self,
+        cache_engine,
+        attn_meta,
+        seq_group_metadata,
+        finished_requests,
+        paused_cpu_seq_groups
+    ):  # called only on driver
+        # 1. update mapping
+        cache_engine.update_mapping(attn_meta, seq_group_metadata,
+                                    finished_requests, paused_cpu_seq_groups)
+        
+        # 2. build pause/resume plan
+        # if cache_engine.pause_and_resume:
+        #     pause_plan, resume_plan = cache_engine.build_pause_resume_plan()
+        # else:
+        #     logger.debug(f"[driver] pause and resume feature => false")
+        #     pause_plan = resume_plan = None
+
+        # 3. build cache plan
+        total_context_lens = attn_meta.seq_lens
+        is_decoding = attn_meta.decode_metadata is not None
+        logger.debug(f"[driver] is_decoding: {is_decoding}")
+        cache_plan, dist = cache_engine.build_cache_plan(seq_group_metadata, total_context_lens, is_decoding, cache_engine.pause_and_resume)
+        # pack into broadcastable structure
+        plan_data = {
+            # 'pause_layers': pause_plan,
+            # 'resume_layers': resume_plan,
+            'cache_plan': cache_plan,
+            'dist_dict': dist,
+            'sid2row': cache_engine.mapping.sid2row,
+        }
+        new_gpu_blocks = []
+        if cache_plan.dealloc_layers or cache_plan.alloc_layers or cache_plan.prefetch_resize or cache_plan.pause_layers:
+            new_gpu_blocks=cache_engine._execute_plan(cache_plan, seq_group_metadata, attn_meta)
+            cache_engine.mapping.prev_dist_dict = dist
+        plan_data['new_gpu_blocks'] = new_gpu_blocks
+
+        cache_engine._sync_active_gpu_cpu_map(cache_engine.mapping.seq_row_order)
+        # logger.critical(f"[driver] active_gpu_cpu_cache_map: {cache_engine.active_gpu_cpu_cache_map}")
+        # logger.critical(f"cache_engine.mapping: {cache_engine.mapping}")
+
+        # bm = cache_engine._get_bm()
+        # plan_data['bm'] = bm
+
+        return plan_data
+
+    def _get_driver_input_and_broadcast(
+        self, execute_model_req: ExecuteModelRequest
+    ) -> Tuple[BroadcastableModelInput, WorkerInput, Dict[str, torch.Tensor]]:
+        """ Get the driver input and broadcast it to other workers.  """
+        assert self.is_driver_worker
+
+        worker_input: WorkerInput = self.prepare_worker_input(
+            execute_model_req=execute_model_req)
+        model_input: ModelRunnerInputBase = (
+            self.model_runner.prepare_model_input(
+                execute_model_req.seq_group_metadata_list,
+                execute_model_req.virtual_engine,
+                execute_model_req.finished_requests_ids))
+
+        kwargs = extract_previous_hidden_states(execute_model_req)
+
+        req_ids = [seq_group_metadata.request_id for seq_group_metadata in execute_model_req.seq_group_metadata_list]
+        req_to_seq_ids = model_input.request_ids_to_seq_ids
+        
+        cached_all_token_ids = []
+        cached_all_position_ids = []
+        req_to_seq_mapping = {}
+        for i, request_id in enumerate(req_ids):
+            seq_ids = req_to_seq_ids[request_id]
+            for seq_id in seq_ids:
+                st = len(cached_all_token_ids)
+                token_ids = execute_model_req.seq_group_metadata_list[i].seq_data[seq_id]._cached_all_token_ids
+                cached_all_token_ids.extend(token_ids)
+                cached_all_position_ids.extend(range(len(token_ids)))
+                en = len(cached_all_token_ids)
+                req_to_seq_mapping[(request_id, seq_id)] = (st, en)
+        cached_all_token_ids = {'token_ids': cached_all_token_ids,'positions':torch.tensor(cached_all_position_ids), 'mappings': req_to_seq_mapping}
+        
+        step = 500
+        if cached_all_token_ids is not None and len(cached_all_token_ids['token_ids']) % step == 0:            
+            logger.debug(f"cached_all_token_ids: {len(cached_all_token_ids['token_ids'])}")
+        logger.debug(f"paused_cpu_seq_groups: {execute_model_req.paused_cpu_seq_groups}")
+        if len(execute_model_req.paused_cpu_seq_groups) > 0:
+            logger.debug(f"paused_cpu_seq_groups: {execute_model_req.paused_cpu_seq_groups}")
+        
+        # build & broadcast plans
+        plan_data = self.prepare_cache_plan(
+            self.cache_engine[worker_input.virtual_engine],            
+            model_input.attn_metadata,
+            execute_model_req.seq_group_metadata_list,
+            execute_model_req.finished_requests_ids,
+            execute_model_req.paused_cpu_seq_groups
+        )
+
+        if self.do_metadata_broadcast:
+            broadcast_data = worker_input.as_broadcastable_tensor_dict()
+            broadcast_data.update(model_input.as_broadcastable_tensor_dict())
+            broadcast_data.update(kwargs)
+            broadcast_data.update(plan_data)
+            broadcast_data['cached_all_token_ids'] = cached_all_token_ids
+            broadcast_tensor_dict(broadcast_data, src=0)
+
+        if execute_model_req.async_callback:
+            model_input = dataclasses.replace(  # type: ignore
+                model_input,
+                async_callback=execute_model_req.async_callback)
+
+        return model_input, worker_input, kwargs, cached_all_token_ids
+
+    def prepare_input(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> Optional[Tuple[BroadcastableModelInput, WorkerInput, Dict[
+            str, torch.Tensor]]]:
+        """
+        Prepare the inputs to ModelRunner and workers.
+        """
+        if self.is_driver_worker:
+            if execute_model_req is None:
+                if self.do_metadata_broadcast:
+                    # This signals that there's no more requests to process for
+                    # now. All workers are running infinite loop with
+                    # broadcast_tensor_dict, and it stops the loop when the
+                    # driver broadcasts an empty input. Send an empty input to
+                    # notify all other workers to stop their execution loop.
+                    broadcast_tensor_dict({}, src=0)
+                return None
+            return self._get_driver_input_and_broadcast(execute_model_req)
+        else:
+            return self._get_worker_input_from_broadcast()
+
+    # (xinyue) called in llm_engine
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None,
+    ) -> Optional[List[SamplerOutput]]:
+        """Executes at least one model step on the given sequences, unless no
+        sequences are provided."""
+        start_time = time.perf_counter()
+
+        inputs = self.prepare_input(execute_model_req)
+        if inputs is None:
+            return None
+
+        model_input, worker_input, kwargs, cached_all_token_ids = inputs
+        num_steps = worker_input.num_steps
+
+        self.execute_worker(worker_input)
+
+        # If there is no input, we don't need to execute the model.
+        if worker_input.num_seq_groups == 0:
+            return []
+
+        intermediate_tensors = None
+        orig_model_execute_time = 0.0
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group()))
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_execute_time):
+                orig_model_execute_time = intermediate_tensors.tensors.get(
+                    "model_execute_time", torch.tensor(0)).item()
+            
+        """ 
+            kv_caches layout: [|<-        32 GPU layers        ->|<-next offloaded layer->|]
+            For each offloaded layer i, kv_caches[i] is assigned to None. 
+            The next offloaded layer is always stored at kv_caches[-1], if prefetch is not done yet, it is None. 
+        """
+        
+        # self.cache_config = self.cache_engine[worker_input.virtual_engine].may_resize_gpu_cache(cached_all_position_ids, attn_metadata=model_input.attn_metadata), seq_group_metadata_list=execute_model_req.seq_group_metadata_list, finished_requests_ids=execute_model_req.finished_requests_ids, paused_cpu_seq_groups=execute_model_req.paused_cpu_seq_groups)
+
+        kv_caches=self.kv_cache[worker_input.virtual_engine] if self.kv_cache is not None else None,
+        kv_caches_cpu=self.kv_cache_cpu[worker_input.virtual_engine] if self.kv_cache_cpu is not None else None,
+        output = self.model_runner.execute_model(
+            model_input=model_input,
+            cached_all_token_ids=cached_all_token_ids,
+            kv_caches=self.kv_cache[worker_input.virtual_engine]
+            if self.kv_cache is not None else None,
+            kv_caches_cpu=self.kv_cache_cpu[worker_input.virtual_engine]
+            if self.kv_cache_cpu is not None else None,
+            gpu_cpu_cache_map=self.cache_engine[worker_input.virtual_engine].active_gpu_cpu_cache_map,
+            intermediate_tensors=intermediate_tensors,
+            num_steps=num_steps,
+            **kwargs,
+        )
+        model_execute_time = time.perf_counter() - start_time
+        if not get_pp_group().is_last_rank:
+            # output is IntermediateTensors
+            assert isinstance(output, IntermediateTensors)
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_execute_time):
+                output.tensors["model_execute_time"] = torch.tensor(
+                    model_execute_time + orig_model_execute_time)
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            return [None]
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_execute_time
+                and output is not None):
+            for o in output:
+                o.model_execute_time = (orig_model_execute_time +
+                                        model_execute_time)
+
+        # output is List[SamplerOutput]
+        return output
+
+    def _execute_model_spmd(
+        self,
+        execute_model_req: ExecuteModelRequest,
+        intermediate_tensors: Optional[IntermediateTensors] = None
+    ) -> Optional[List[SamplerOutput]]:
+        """
+        Execute model in Single Program Multiple Data (SPMD) fashion.
+        All workers take the same request, prepare the input and
+        execute the model.
+        """
+        assert execute_model_req is not None, (
+            "_execute_model_spmd() requires each worker to take in an "
+            "ExecuteModelRequest")
+        worker_input: WorkerInput = self.prepare_worker_input(
+            execute_model_req=execute_model_req)
+        model_input: ModelRunnerInputBase = (
+            self.model_runner.prepare_model_input(
+                execute_model_req.seq_group_metadata_list))
+
+        self.execute_worker(worker_input)
+
+        # If there is no input, we don't need to execute the model.
+        if worker_input.num_seq_groups == 0:
+            return []
+
+        kwargs = extract_previous_hidden_states(execute_model_req)
+
+        return self.model_runner.execute_model(
+            model_input=model_input,
+            kv_caches=self.kv_cache[worker_input.virtual_engine]
+            if self.kv_cache is not None else None,
+            intermediate_tensors=intermediate_tensors,
+            **kwargs,
+        )
+
+
+class WorkerWrapperBase:
+    
+    """
+    The whole point of this class is to lazily initialize the worker.
+    We first instantiate the WorkerWrapper, which remembers the worker module
+    and class name. Then, when we call `update_environment_variables`, and the
+    real initialization happens in `init_worker`.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+    ) -> None:
+        self.vllm_config = vllm_config
+        trust_remote_code = vllm_config.model_config.trust_remote_code
+        self.worker: Optional[WorkerBase] = None
+        if trust_remote_code:
+            # note: lazy import to avoid importing torch before initializing
+            from vllm.utils import init_cached_hf_modules
+            init_cached_hf_modules()
+
+    @staticmethod
+    def update_environment_variables(envs: Dict[str, str]) -> None:
+        key = 'CUDA_VISIBLE_DEVICES'
+        if key in envs and key in os.environ:
+            # overwriting CUDA_VISIBLE_DEVICES is desired behavior
+            # suppress the warning in `update_environment_variables`
+            del os.environ[key]
+        update_environment_variables(envs)
+
+    def init_worker(self, *args, **kwargs):
+        """
+        Here we inject some common logic before initializing the worker.
+        Arguments are passed to the worker class constructor.
+        """
+        enable_trace_function_call_for_thread(self.vllm_config)
+
+        # see https://github.com/NVIDIA/nccl/issues/1234
+        os.environ['NCCL_CUMEM_ENABLE'] = '0'
+
+        from vllm.plugins import load_general_plugins
+        load_general_plugins()
+
+        worker_class = resolve_obj_by_qualname(
+            self.vllm_config.parallel_config.worker_cls)
+        self.worker = worker_class(*args, **kwargs)
+        assert self.worker is not None
+
+        # from vllm.llm_engine import LLMEngine
+        # engine = LLMEngine._instance  
+        # for v_id in range(engine.parallel_config.pipeline_parallel_size):
+        #     self.worker.cache_engine[v_id].register_bm(engine.scheduler[v_id].block_manager)
+
+    def execute_method(self, method: str, *args, **kwargs):
+        try:
+            target = self if self.worker is None else self.worker
+            executor = getattr(target, method)
+            return executor(*args, **kwargs)
+        except Exception as e:
+            # if the driver worker also execute methods,
+            # exceptions in the rest worker may cause deadlock in rpc like ray
+            # see https://github.com/vllm-project/vllm/issues/3455
+            # print the error and inform the user to solve the error
+            msg = (f"Error executing method {method}. "
+                   "This might cause deadlock in distributed execution.")
+            logger.exception(msg)
+            raise e
+
+    def __getattr__(self, attr):
+        return getattr(self.worker, attr)
+
+
+def extract_previous_hidden_states(
+        data: Union[ExecuteModelRequest, Dict[str, torch.Tensor]]) -> \
+            Dict[str, torch.Tensor]:
+    """If data contains previous_hidden_states, extract it. This returns a dict
+    which can be used directly as additional kwargs in any following 
+    execute_model calls. This is used in draft models like EAGLE."""
+    output = {}
+
+    # When called from non-driver worker, data is dict but when called from
+    # driver worker, data is ExecuteModelRequest.
+    if isinstance(data, dict):
+        if "previous_hidden_states" in data:
+            output["previous_hidden_states"] = data["previous_hidden_states"]
+    elif data.previous_hidden_states is not None:
+        output["previous_hidden_states"] = data.previous_hidden_states\
+            .hidden_states
+
+    return output

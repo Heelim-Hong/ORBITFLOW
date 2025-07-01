@@ -1,0 +1,5 @@
+# Common dependencies
+-r requirements-common.txt
+
+# Dependencies for CPUs
+datasets # for benchmark scripts

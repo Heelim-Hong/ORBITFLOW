@@ -1,0 +1,16 @@
+{
+  "arrival_pattern":{"type":"DiscretePoissonArrival","params":{"lambda_per_step":0.01,"max_steps":4000}},
+  "batch_size":4,
+  "num_gpu_blocks_override": 400,
+  "request_type_probs":[["Creative Generation",0.4],["Proofreading",0.6]],
+  "vocab":[200,30000],
+  "requests":{
+    "request_0":{"category":"Proofreading","input_length":3686,"output_length":134,"arrival_time":0,"sched_time":0,"wait_time":0},
+    "request_1":{"category":"Proofreading","input_length":2351,"output_length":107,"arrival_time":0,"sched_time":0,"wait_time":0},
+    "request_2":{"category":"Creative Generation","input_length":92,"output_length":1579,"arrival_time":0,"sched_time":0,"wait_time":0},
+    "request_3":{"category":"Proofreading","input_length":3554,"output_length":80,"arrival_time":0,"sched_time":0,"wait_time":0},
+    "request_4":{"category":"Proofreading","input_length":4443,"output_length":130,"arrival_time":564,"sched_time":564,"wait_time":0},
+    "request_5":{"category":"Proofreading","input_length":3261,"output_length":134,"arrival_time":604,"sched_time":604,"wait_time":0},
+    "request_6":{"category":"Proofreading","input_length":2913,"output_length":108,"arrival_time":740,"sched_time":740,"wait_time":0}
+  }
+}
