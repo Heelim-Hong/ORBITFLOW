@@ -1,0 +1,18 @@
+# Common dependencies
+-r requirements-common.txt
+
+# Dependencies for TPU
+cmake>=3.26
+ninja
+packaging
+setuptools-scm>=8
+wheel
+jinja2
+ray[default]
+
+--pre
+--find-links https://storage.googleapis.com/libtpu-releases/index.html
+--find-links https://storage.googleapis.com/jax-releases/jax_nightly_releases.html
+--find-links https://storage.googleapis.com/jax-releases/jaxlib_nightly_releases.html
+jaxlib==0.4.36.dev20241122
+jax==0.4.36.dev20241122

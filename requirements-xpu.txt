@@ -1,0 +1,13 @@
+# Common dependencies
+-r requirements-common.txt
+
+ray >= 2.9
+cmake>=3.26
+ninja
+packaging
+setuptools-scm>=8
+wheel
+jinja2
+
+
+triton-xpu == 3.0.0b1

@@ -1,0 +1,6 @@
+# Common dependencies
+-r requirements-common.txt
+
+# Dependencies for NVIDIA GPUs
+ray[default] >= 2.9
+nvidia-ml-py >= 12.560.30 # for pynvml package
